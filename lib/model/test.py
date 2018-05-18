@@ -16,14 +16,16 @@ except ImportError:
 import os
 import math
 
-from utils.timer import Timer
-from model.nms_wrapper import nms
-from utils.blob import im_list_to_blob
+from lib.utils.timer import Timer
+from lib.model.nms_wrapper import nms
+from lib.utils.blob import im_list_to_blob
 
-from model.config import cfg, get_output_dir
-from model.bbox_transform import clip_boxes, bbox_transform_inv
+from lib.model.config import cfg, get_output_dir
+from lib.model.bbox_transform import clip_boxes, bbox_transform_inv
 
 import torch
+
+
 
 def _get_image_blob(im):
   """Converts an image into a network input.
@@ -59,12 +61,58 @@ def _get_image_blob(im):
 
   return blob, np.array(im_scale_factors)
 
+
+def _get_image_blob_batch(ims):
+  """Converts an image into a network input.
+  Arguments:
+    im (ndarray): a color image in BGR order
+  Returns:
+    blob (ndarray): a data blob holding an image pyramid
+    im_scale_factors (list): list of image scales (relative to im) used
+      in the image pyramid
+  """
+  im_origs = ims.astype(np.float32, copy=True)
+  im_origs -= cfg.PIXEL_MEANS
+
+  im_shape = im_origs.shape
+  im_size_min = np.min(im_shape[1:3])
+  im_size_max = np.max(im_shape[1:3])
+
+  processed_ims = []
+  im_scale_factors = []
+
+  for target_size in cfg.TEST.SCALES:
+    im_scale = float(target_size) / float(im_size_min)
+    # Prevent the biggest axis from being more than MAX_SIZE
+    if np.round(im_scale * im_size_max) > cfg.TEST.MAX_SIZE:
+      im_scale = float(cfg.TEST.MAX_SIZE) / float(im_size_max)
+    ims = np.array(list(map(lambda im_orig:cv2.resize(im_orig, None, None, fx=im_scale, fy=im_scale,
+            interpolation=cv2.INTER_LINEAR),im_origs)))
+    im_scale_factors.append(im_scale)
+    processed_ims.append(ims)
+
+  processed_ims = np.concatenate(processed_ims)
+  # Create a blob to hold the input images
+  blob = im_list_to_blob(processed_ims)
+
+  return blob, np.array(im_scale_factors)
+
+# np.array(processed_ims).shape
+
 def _get_blobs(im):
   """Convert an image and RoIs within that image into network inputs."""
   blobs = {}
   blobs['data'], im_scale_factors = _get_image_blob(im)
 
   return blobs, im_scale_factors
+
+def _get_blobs_batch(ims):
+  """Convert an image and RoIs within that image into network inputs."""
+  blobs = {}
+  blobs['data'], im_scale_factors = _get_image_blob_batch(ims)
+
+  return blobs, im_scale_factors
+
 
 def _clip_boxes(boxes, im_shape):
   """Clip boxes to image boundaries."""
@@ -93,7 +141,7 @@ def im_detect(net, im):
   blobs['im_info'] = np.array([im_blob.shape[1], im_blob.shape[2], im_scales[0]], dtype=np.float32)
 
   _, scores, bbox_pred, rois = net.test_image(blobs['data'], blobs['im_info'])
-  
+
   boxes = rois[:, 1:5] / im_scales[0]
   scores = np.reshape(scores, [scores.shape[0], -1])
   bbox_pred = np.reshape(bbox_pred, [bbox_pred.shape[0], -1])
@@ -107,6 +155,34 @@ def im_detect(net, im):
     pred_boxes = np.tile(boxes, (1, scores.shape[1]))
 
   return scores, pred_boxes
+
+
+def im_detect_batch(net, ims):
+  blobs, im_scales = _get_blobs_batch(ims)
+
+  im_blob = blobs['data']
+  blobs['im_info'] = np.array([im_blob.shape[1], im_blob.shape[2], im_scales[0]], dtype=np.float32)
+
+  _, scores, bbox_preds, rois = net.test_images(blobs['data'], blobs['im_info'])
+
+  scoress,pred_boxess = [],[]
+  for i in range(len(ims)):
+      boxes = rois[i][:, 1:5] / im_scales[0]
+      score = np.reshape(scores[i], [scores[i].shape[0], -1])
+      bbox_pred = np.reshape(bbox_preds[i], [bbox_preds[i].shape[0], -1])
+      if cfg.TEST.BBOX_REG:
+        # Apply bounding-box regression deltas
+        box_deltas = bbox_pred
+        pred_boxes = bbox_transform_inv(torch.from_numpy(boxes), torch.from_numpy(box_deltas)).numpy()
+        pred_boxes = _clip_boxes(pred_boxes, ims[i].shape)
+      else:
+        # Simply repeat the boxes, once for each class
+        pred_boxes = np.tile(boxes, (1, score.shape[1]))
+      pred_boxess.append(pred_boxes)
+      scoress.append(score)
+
+  return scoress,pred_boxess
+
 
 def apply_nms(all_boxes, thresh):
   """Apply non-maximum suppression to all predicted boxes output by the
@@ -192,4 +268,3 @@ def test_net(net, imdb, weights_filename, max_per_image=100, thresh=0.):
 
   print('Evaluating detections')
   imdb.evaluate_detections(all_boxes, output_dir)
-

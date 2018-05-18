@@ -14,20 +14,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
+import signal
+import lib.utils.timer
 
-import utils.timer
+from lib.layer_utils.snippets import generate_anchors_pre
+from lib.layer_utils.proposal_layer import proposal_layer
+from lib.layer_utils.proposal_top_layer import proposal_top_layer
+from lib.layer_utils.proposal_layer import proposal_layer_batch
+from lib.layer_utils.proposal_top_layer import proposal_top_layer_batch
+from lib.layer_utils.anchor_target_layer import anchor_target_layer
+from lib.layer_utils.proposal_target_layer import proposal_target_layer
+from lib.utils.visualization import draw_bounding_boxes
 
-from layer_utils.snippets import generate_anchors_pre
-from layer_utils.proposal_layer import proposal_layer
-from layer_utils.proposal_top_layer import proposal_top_layer
-from layer_utils.anchor_target_layer import anchor_target_layer
-from layer_utils.proposal_target_layer import proposal_target_layer
-from utils.visualization import draw_bounding_boxes
+from lib.layer_utils.roi_pooling.roi_pool import RoIPoolFunction
+from lib.layer_utils.roi_align.crop_and_resize import CropAndResizeFunction
 
-from layer_utils.roi_pooling.roi_pool import RoIPoolFunction
-from layer_utils.roi_align.crop_and_resize import CropAndResizeFunction
-
-from model.config import cfg
+from lib.model.config import cfg
 
 import tensorboardX as tb
 
@@ -47,7 +49,8 @@ class Network(nn.Module):
     self._event_summaries = {}
     self._image_gt_summaries = {}
     self._variables_to_fix = {}
-    self._device = 'cuda'
+    self._cuda_device = 0
+    self._device = "cuda"
 
   def _add_gt_image(self):
     # add back mean
@@ -88,6 +91,21 @@ class Network(nn.Module):
 
     return rois, rpn_scores
 
+  def _proposal_top_layer_batch(self, rpn_cls_prob, rpn_bbox_pred):
+    rois, rpn_scores = proposal_top_layer_batch(\
+                                    rpn_cls_prob, rpn_bbox_pred, self._im_info,
+                                     self._feat_stride, self._anchors, self._num_anchors, self._cuda_device)
+    return rois, rpn_scores
+
+  def _proposal_layer_batch(self, rpn_cls_prob, rpn_bbox_pred):
+    rois, rpn_scores = proposal_layer_batch(\
+                                    rpn_cls_prob, rpn_bbox_pred, self._im_info, self._mode,
+                                     self._feat_stride, self._anchors, self._num_anchors, self._cuda_device)
+
+    return rois, rpn_scores
+
+
+
   def _roi_pool_layer(self, bottom, rois):
     return RoIPoolFunction(cfg.POOLING_SIZE, cfg.POOLING_SIZE, 1. / 16.)(bottom, rois)
 
@@ -115,7 +133,7 @@ class Network(nn.Module):
     width = bottom.size(3)
 
     pre_pool_size = cfg.POOLING_SIZE * 2 if max_pool else cfg.POOLING_SIZE
-    crops = CropAndResizeFunction(pre_pool_size, pre_pool_size)(bottom, 
+    crops = CropAndResizeFunction(pre_pool_size, pre_pool_size)(bottom,
       torch.cat([y1/(height-1),x1/(width-1),y2/(height-1),x2/(width-1)], 1), rois[:, 0].int())
     if max_pool:
       crops = F.max_pool2d(crops, 2, 2)
@@ -126,10 +144,10 @@ class Network(nn.Module):
       anchor_target_layer(
       rpn_cls_score.data, self._gt_boxes.data.cpu().numpy(), self._im_info, self._feat_stride, self._anchors.data.cpu().numpy(), self._num_anchors)
 
-    rpn_labels = torch.from_numpy(rpn_labels).float().to(self._device) #.set_shape([1, 1, None, None])
-    rpn_bbox_targets = torch.from_numpy(rpn_bbox_targets).float().to(self._device)#.set_shape([1, None, None, self._num_anchors * 4])
-    rpn_bbox_inside_weights = torch.from_numpy(rpn_bbox_inside_weights).float().to(self._device)#.set_shape([1, None, None, self._num_anchors * 4])
-    rpn_bbox_outside_weights = torch.from_numpy(rpn_bbox_outside_weights).float().to(self._device)#.set_shape([1, None, None, self._num_anchors * 4])
+    rpn_labels = torch.from_numpy(rpn_labels).float().cuda(self._cuda_device) #.set_shape([1, 1, None, None])
+    rpn_bbox_targets = torch.from_numpy(rpn_bbox_targets).float().cuda(self._cuda_device)#.set_shape([1, None, None, self._num_anchors * 4])
+    rpn_bbox_inside_weights = torch.from_numpy(rpn_bbox_inside_weights).float().cuda(self._cuda_device)#.set_shape([1, None, None, self._num_anchors * 4])
+    rpn_bbox_outside_weights = torch.from_numpy(rpn_bbox_outside_weights).float().cuda(self._cuda_device)#.set_shape([1, None, None, self._num_anchors * 4])
 
     rpn_labels = rpn_labels.long()
     self._anchor_targets['rpn_labels'] = rpn_labels
@@ -165,7 +183,7 @@ class Network(nn.Module):
     anchors, anchor_length = generate_anchors_pre(\
                                           height, width,
                                            self._feat_stride, self._anchor_scales, self._anchor_ratios)
-    self._anchors = torch.from_numpy(anchors).to(self._device)
+    self._anchors = torch.from_numpy(anchors).cuda(self._cuda_device)
     self._anchor_length = anchor_length
 
   def _smooth_l1_loss(self, bbox_pred, bbox_targets, bbox_inside_weights, bbox_outside_weights, sigma=1.0, dim=[1]):
@@ -234,7 +252,7 @@ class Network(nn.Module):
     # change it so that the score has 2 as its channel size
     rpn_cls_score_reshape = rpn_cls_score.view(1, 2, -1, rpn_cls_score.size()[-1]) # batch * 2 * (num_anchors*h) * w
     rpn_cls_prob_reshape = F.softmax(rpn_cls_score_reshape, dim=1)
-    
+
     # Move channel to the last dimenstion, to fit the input of python functions
     rpn_cls_prob = rpn_cls_prob_reshape.view_as(rpn_cls_score).permute(0, 2, 3, 1) # batch * h * w * (num_anchors * 2)
     rpn_cls_score = rpn_cls_score.permute(0, 2, 3, 1) # batch * h * w * (num_anchors * 2)
@@ -265,6 +283,47 @@ class Network(nn.Module):
 
     return rois
 
+  def _region_proposal_batch(self, net_conv):
+    rpn = F.relu(self.rpn_net(net_conv))
+    self._act_summaries['rpn'] = rpn
+
+    rpn_cls_score = self.rpn_cls_score_net(rpn) # batch * (num_anchors * 2) * h * w
+
+    # change it so that the score has 2 as its channel size
+    rpn_cls_score_reshape = rpn_cls_score.view(rpn_cls_score.size(0), 2, -1, rpn_cls_score.size()[-1]) # batch * 2 * (num_anchors*h) * w
+    rpn_cls_prob_reshape = F.softmax(rpn_cls_score_reshape, dim=1)
+
+    # Move channel to the last dimenstion, to fit the input of python functions
+    rpn_cls_prob = rpn_cls_prob_reshape.view_as(rpn_cls_score).permute(0, 2, 3, 1) # batch * h * w * (num_anchors * 2)
+    rpn_cls_score = rpn_cls_score.permute(0, 2, 3, 1) # batch * h * w * (num_anchors * 2)
+    rpn_cls_score_reshape = rpn_cls_score_reshape.permute(0, 2, 3, 1).contiguous()  # batch * (num_anchors*h) * w * 2
+    rpn_cls_pred = torch.max(rpn_cls_score_reshape.view(rpn_cls_score.size(0),-1, 2), 2)[1]
+
+    rpn_bbox_pred = self.rpn_bbox_pred_net(rpn)
+    rpn_bbox_pred = rpn_bbox_pred.permute(0, 2, 3, 1).contiguous()  # batch * h * w * (num_anchors*4)
+
+    if self._mode == 'TRAIN':
+      rois, roi_scores = self._proposal_layer(rpn_cls_prob, rpn_bbox_pred) # rois, roi_scores are varible
+      rpn_labels = self._anchor_target_layer(rpn_cls_score)
+      rois, _ = self._proposal_target_layer(rois, roi_scores)
+    else:
+      if cfg.TEST.MODE == 'nms':
+        rois, _ = self._proposal_layer_batch(rpn_cls_prob, rpn_bbox_pred)
+      elif cfg.TEST.MODE == 'top':
+        rois, _ = self._proposal_top_layer_batch(rpn_cls_prob, rpn_bbox_pred)
+      else:
+        raise NotImplementedError
+
+    self._predictions["rpn_cls_score"] = rpn_cls_score
+    self._predictions["rpn_cls_score_reshape"] = rpn_cls_score_reshape
+    self._predictions["rpn_cls_prob"] = rpn_cls_prob
+    self._predictions["rpn_cls_pred"] = rpn_cls_pred
+    self._predictions["rpn_bbox_pred"] = rpn_bbox_pred
+    self._predictions["rois"] = rois
+
+    return rois
+
+
   def _region_classification(self, fc7):
     cls_score = self.cls_score_net(fc7)
     cls_pred = torch.max(cls_score, 1)[1]
@@ -275,6 +334,19 @@ class Network(nn.Module):
     self._predictions["cls_pred"] = cls_pred
     self._predictions["cls_prob"] = cls_prob
     self._predictions["bbox_pred"] = bbox_pred
+
+    return cls_prob, bbox_pred
+
+  def _region_classification_batch(self, fc7):
+    cls_score = self.cls_score_net(fc7)
+    cls_pred = torch.max(cls_score, 1)[1]
+    cls_prob = F.softmax(cls_score, dim=1)
+    bbox_pred = self.bbox_pred_net(fc7)
+
+    self._predictions["cls_score"].append(cls_score)
+    self._predictions["cls_pred"].append(cls_pred)
+    self._predictions["cls_prob"].append(cls_prob)
+    self._predictions["bbox_pred"].append(bbox_pred)
 
     return cls_prob, bbox_pred
 
@@ -309,7 +381,7 @@ class Network(nn.Module):
     self.rpn_net = nn.Conv2d(self._net_conv_channels, cfg.RPN_CHANNELS, [3, 3], padding=1)
 
     self.rpn_cls_score_net = nn.Conv2d(cfg.RPN_CHANNELS, self._num_anchors * 2, [1, 1])
-    
+
     self.rpn_bbox_pred_net = nn.Conv2d(cfg.RPN_CHANNELS, self._num_anchors * 4, [1, 1])
 
     self.cls_score_net = nn.Linear(self._fc7_channels, self._num_classes)
@@ -343,7 +415,7 @@ class Network(nn.Module):
           summaries.append(self._add_train_summary(k, var))
 
       self._image_gt_summaries = {}
-    
+
     return summaries
 
   def _predict(self):
@@ -353,7 +425,7 @@ class Network(nn.Module):
 
     # build the anchors for the image
     self._anchor_component(net_conv.size(2), net_conv.size(3))
-   
+
     rois = self._region_proposal(net_conv)
     if cfg.POOLING_MODE == 'crop':
       pool5 = self._crop_pool_layer(net_conv, rois)
@@ -365,11 +437,63 @@ class Network(nn.Module):
     fc7 = self._head_to_tail(pool5)
 
     cls_prob, bbox_pred = self._region_classification(fc7)
-    
+
     for k in self._predictions.keys():
       self._score_summaries[k] = self._predictions[k]
 
     return rois, cls_prob, bbox_pred
+
+
+  def _predict_batch(self):
+    # This is just _build_network in tf-faster-rcnn
+    torch.backends.cudnn.benchmark = False
+    net_conv = self._image_to_head()
+
+    # build the anchors for the image
+    self._anchor_component(net_conv.size(2), net_conv.size(3))
+    #net_conv.size : (bs,1024,h,w)
+    rois = self._region_proposal_batch(net_conv)
+    if cfg.POOLING_MODE == 'crop':
+      pool5 = list(map(lambda x : self._crop_pool_layer(net_conv, x),rois))
+    else:
+      pool5 = self._roi_pool_layer(net_conv, rois)
+
+    if self._mode == 'TRAIN':
+      torch.backends.cudnn.benchmark = True # benchmark because now the input size are fixed
+    fc7 = list(map(self._head_to_tail,pool5))
+
+    self._predictions["cls_score"] = []
+    self._predictions["cls_pred"] = []
+    self._predictions["cls_prob"] = []
+    self._predictions["bbox_pred"] = []
+    cls_probs_bbox_preds = list(map(self._region_classification_batch,fc7))
+    cls_prob, bbox_pred = [x[0] for x in cls_probs_bbox_preds],[x[1] for x in cls_probs_bbox_preds]
+
+    for k in self._predictions.keys():
+      self._score_summaries[k] = self._predictions[k]
+
+    return rois, cls_prob, bbox_pred
+
+  def forward_batch(self, image, im_info, gt_boxes=None, mode='TRAIN'):
+    self._image_gt_summaries['image'] = image
+    self._image_gt_summaries['gt_boxes'] = gt_boxes
+    self._image_gt_summaries['im_info'] = im_info
+
+    self._image = torch.from_numpy(image.transpose([0,3,1,2])).cuda(self._cuda_device)
+    self._im_info = im_info # No need to change; actually it can be an list
+    self._gt_boxes = torch.from_numpy(gt_boxes).cuda(self._cuda_device) if gt_boxes is not None else None
+
+    self._mode = mode
+
+    rois, cls_prob, bbox_preds = self._predict_batch()
+
+    if mode == 'TEST':
+      stds = list(map(lambda x : x.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS).repeat(self._num_classes).unsqueeze(0).expand_as(x),bbox_preds))
+      means = list(map(lambda x : x.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(self._num_classes).unsqueeze(0).expand_as(x),bbox_preds))
+      self._predictions["bbox_pred"] = list(map(lambda i : bbox_preds[i].mul(stds[i]).add(means[i]), range(len(stds))))
+    else:
+      self._add_losses() # compute losses
+
 
   def forward(self, image, im_info, gt_boxes=None, mode='TRAIN'):
     self._image_gt_summaries['image'] = image
@@ -391,6 +515,8 @@ class Network(nn.Module):
     else:
       self._add_losses() # compute losses
 
+
+
   def init_weights(self):
     def normal_init(m, mean, stddev, truncated=False):
       """
@@ -402,7 +528,7 @@ class Network(nn.Module):
       else:
         m.weight.data.normal_(mean, stddev)
       m.bias.data.zero_()
-      
+
     normal_init(self.rpn_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
     normal_init(self.rpn_cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
     normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
@@ -412,7 +538,7 @@ class Network(nn.Module):
   # Extract the head feature maps, for example for vgg16 it is conv5_3
   # only useful during testing mode
   def extract_head(self, image):
-    feat = self._layers["head"](torch.from_numpy(image.transpose([0,3,1,2])).to(self._device))
+    feat = self._layers["head"](torch.from_numpy(image.transpose([0,3,1,2])).cuda(self._cuda_device))
     return feat
 
   # only useful during testing mode
@@ -424,6 +550,16 @@ class Network(nn.Module):
                                                      self._predictions['cls_prob'].data.cpu().numpy(), \
                                                      self._predictions['bbox_pred'].data.cpu().numpy(), \
                                                      self._predictions['rois'].data.cpu().numpy()
+    return cls_score, cls_prob, bbox_pred, rois
+
+  def test_images(self, images, im_info):
+    self.eval()
+    with torch.no_grad():
+      self.forward_batch(images, im_info, None, mode='TEST')
+    cls_score, cls_prob, bbox_pred, rois = list(map(lambda x : x.data.cpu().numpy(),self._predictions['cls_score'])), \
+                                                     list(map(lambda x : x.data.cpu().numpy(),self._predictions['cls_prob'])), \
+                                                     list(map(lambda x : x.data.cpu().numpy(),self._predictions['bbox_pred'])), \
+                                                     list(map(lambda x : x.data.cpu().numpy(),self._predictions['rois']))
     return cls_score, cls_prob, bbox_pred, rois
 
   def delete_intermediate_states(self):
@@ -482,9 +618,8 @@ class Network(nn.Module):
 
   def load_state_dict(self, state_dict):
     """
-    Because we remove the definition of fc layer in resnet now, it will fail when loading 
+    Because we remove the definition of fc layer in resnet now, it will fail when loading
     the model trained before.
     To provide back compatibility, we overwrite the load_state_dict
     """
     nn.Module.load_state_dict(self, {k: state_dict[k] for k in list(self.state_dict())})
-

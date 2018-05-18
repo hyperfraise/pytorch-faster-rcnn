@@ -7,10 +7,10 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from nets.network import Network
-from model.config import cfg
+from lib.nets.network import Network
+from lib.model.config import cfg
 
-import utils.timer
+import lib.utils.timer
 
 import torch
 import torch.nn as nn
@@ -110,7 +110,7 @@ class resnetv1(Network):
     return net_conv
 
   def _head_to_tail(self, pool5):
-    fc7 = self.resnet.layer4(pool5).mean(3).mean(2) # average pooling after layer4
+    fc7 = self.resnet.module.layer4(pool5).mean(3).mean(2) # average pooling after layer4
     return fc7
 
   def _init_head_tail(self):
@@ -128,7 +128,7 @@ class resnetv1(Network):
       # other numbers are not supported
       raise NotImplementedError
 
-    # Fix blocks 
+    # Fix blocks
     for p in self.resnet.bn1.parameters(): p.requires_grad=False
     for p in self.resnet.conv1.parameters(): p.requires_grad=False
     assert (0 <= cfg.RESNET.FIXED_BLOCKS < 4)
@@ -147,7 +147,7 @@ class resnetv1(Network):
     self.resnet.apply(set_bn_fix)
 
     # Build resnet.
-    self._layers['head'] = nn.Sequential(self.resnet.conv1, self.resnet.bn1,self.resnet.relu, 
+    self._layers['head'] = nn.Sequential(self.resnet.conv1, self.resnet.bn1,self.resnet.relu,
       self.resnet.maxpool,self.resnet.layer1,self.resnet.layer2,self.resnet.layer3)
 
   def train(self, mode=True):

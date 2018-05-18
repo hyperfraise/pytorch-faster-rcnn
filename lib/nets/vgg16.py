@@ -7,8 +7,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from nets.network import Network
-from model.config import cfg
+from lib.nets.network import Network
+from lib.model.config import cfg
 
 import torch
 import torch.nn as nn
@@ -40,7 +40,7 @@ class vgg16(Network):
   def _image_to_head(self):
     net_conv = self._layers['head'](self._image)
     self._act_summaries['conv'] = net_conv
-    
+
     return net_conv
 
   def _head_to_tail(self, pool5):

@@ -15,8 +15,8 @@ from torch.autograd import Variable
 import numpy as np
 from collections import namedtuple, OrderedDict
 
-from nets.network import Network
-from model.config import cfg
+from lib.nets.network import Network
+from lib.model.config import cfg
 
 # The following is adapted from:
 # https://github.com/tensorflow/models/blob/master/slim/nets/mobilenet_v1.py
@@ -193,7 +193,7 @@ class mobilenetv1(Network):
       else:
         m.weight.data.normal_(mean, stddev)
       if m.bias is not None: m.bias.data.zero_()
-      
+
     self.mobilenet.apply(lambda m: normal_init(m, 0, 0.09, True))
     normal_init(self.rpn_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
     normal_init(self.rpn_cls_score_net, 0, 0.01,  cfg.TRAIN.TRUNCATED)
@@ -215,12 +215,12 @@ class mobilenetv1(Network):
   def _init_head_tail(self):
     self.mobilenet = mobilenet_v1_base()
 
-    # Fix blocks  
+    # Fix blocks
     assert (0 <= cfg.MOBILENET.FIXED_LAYERS <= 12)
     for m in list(self.mobilenet.children())[:cfg.MOBILENET.FIXED_LAYERS]:
       for p in m.parameters():
         p.requires_grad = False
-    
+
     def set_bn_fix(m):
       classname = m.__class__.__name__
       if classname.find('BatchNorm') != -1:
